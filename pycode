@@ -1,0 +1,45 @@
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col
+import pyspark.sql.functions as F
+
+# Initialize Spark session
+spark = SparkSession.builder \
+    .appName("OptimizedS3Join") \
+    .config("spark.sql.shuffle.partitions", "200") \  # Adjust partitions based on data size
+    .getOrCreate()
+
+# Read metadata directly into Spark (avoiding Pandas)
+metadata_path = "s3://your-metadata-path/metadata.csv"  # Update this path
+metadata_df = spark.read.csv(metadata_path, header=True, inferSchema=True)
+
+# Get distinct feature groups
+feature_groups = metadata_df.select("feature_group").distinct()
+
+# Process each feature group in parallel
+for fg_row in feature_groups.collect():  # Small data, safe to collect
+    feature_group = fg_row["feature_group"]
+
+    # Filter metadata for this feature group
+    fg_metadata = metadata_df.filter(col("feature_group") == feature_group)
+
+    # Read the full dataset (avoiding collect())
+    src_path = fg_metadata.select("src_path").distinct().first()["src_path"]
+    full_df = spark.read.parquet(src_path)
+
+    # Read all individual feature datasets and join them efficiently
+    feature_dfs = []
+    
+    for row in fg_metadata.collect():  # Metadata should be small enough for collect()
+        feature_path = f"{row['src_path']}/{row['feature_name']}"
+        feature_df = spark.read.parquet(feature_path).select(row["key_col"], row["feature_name"])
+        feature_dfs.append(feature_df)
+
+    # Efficiently reduce joins instead of looping
+    from functools import reduce
+    full_df = reduce(lambda df1, df2: df1.join(df2, on=row["key_col"], how="left"), feature_dfs, full_df)
+
+    # Write output efficiently
+    target_path = fg_metadata.select("tgt_path").distinct().first()["tgt_path"]
+    full_df.write.mode("overwrite").partitionBy("feature_group").parquet(target_path)
+
+print("Processing complete.")
