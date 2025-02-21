@@ -1,45 +1,57 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col
-import pyspark.sql.functions as F
+from pyspark.sql.functions import col, lit, expr
 
-# Initialize Spark session
-spark = SparkSession.builder \
-    .appName("OptimizedS3Join") \
-    .config("spark.sql.shuffle.partitions", "200") \  # Adjust partitions based on data size
-    .getOrCreate()
+def read_metadata(spark, metadata_path):
+    """Read metadata CSV from S3."""
+    return spark.read.option("header", "true").csv(metadata_path)
 
-# Read metadata directly into Spark (avoiding Pandas)
-metadata_path = "s3://your-metadata-path/metadata.csv"  # Update this path
-metadata_df = spark.read.csv(metadata_path, header=True, inferSchema=True)
+def read_source_data(spark, src_path):
+    """Read Parquet source data from S3."""
+    return spark.read.parquet(src_path)
 
-# Get distinct feature groups
-feature_groups = metadata_df.select("feature_group").distinct()
-
-# Process each feature group in parallel
-for fg_row in feature_groups.collect():  # Small data, safe to collect
-    feature_group = fg_row["feature_group"]
-
-    # Filter metadata for this feature group
-    fg_metadata = metadata_df.filter(col("feature_group") == feature_group)
-
-    # Read the full dataset (avoiding collect())
-    src_path = fg_metadata.select("src_path").distinct().first()["src_path"]
-    full_df = spark.read.parquet(src_path)
-
-    # Read all individual feature datasets and join them efficiently
-    feature_dfs = []
+def apply_transformations(df, metadata_df, feature_group):
+    """Dynamically apply transformations based on metadata."""
     
-    for row in fg_metadata.collect():  # Metadata should be small enough for collect()
-        feature_path = f"{row['src_path']}/{row['feature_name']}"
-        feature_df = spark.read.parquet(feature_path).select(row["key_col"], row["feature_name"])
-        feature_dfs.append(feature_df)
+    group_meta = metadata_df.filter(col("feature_group") == feature_group).collect()
+    
+    for row in group_meta:
+        agg_type = row["agg_type"]
+        agg_func = row["agg_func"]
+        base_column = row["base_column"]
+        group_by_cols = row["group_by_columns"].split(",") if row["group_by_columns"] else []
+        partition_column = row["partition_column"]
+        window_size = row["window_size_in_days"]
+        round_decimal = row["round_decimal_point"]
+        window_offset = row["window_offset"]
+        filter_condition = row["filter"]
 
-    # Efficiently reduce joins instead of looping
-    from functools import reduce
-    full_df = reduce(lambda df1, df2: df1.join(df2, on=row["key_col"], how="left"), feature_dfs, full_df)
+        if filter_condition and filter_condition.lower() != "null":
+            df = df.filter(expr(filter_condition))
 
-    # Write output efficiently
-    target_path = fg_metadata.select("tgt_path").distinct().first()["tgt_path"]
-    full_df.write.mode("overwrite").partitionBy("feature_group").parquet(target_path)
+        if agg_type == "base_aggregation":
+            df = df.transform(base_aggregation, agg_func=agg_func, cols_to_agg=[base_column], group_by_col=group_by_cols)
+        elif agg_type == "rolling_aggregation":
+            df = df.transform(rollingwindowagg, agg_func=agg_func, num_cols_agg=[base_column],
+                              windowsize=window_size, partition_by=[partition_column],
+                              round_decimal_point=round_decimal, window_offset=window_offset)
+    return df
 
-print("Processing complete.")
+def main():
+    spark = SparkSession.builder.appName("MetadataDrivenAggregation").getOrCreate()
+    
+    metadata_path = "s3://your-bucket/metadata.csv"  # Change this
+    metadata_df = read_metadata(spark, metadata_path)
+    
+    feature_groups = metadata_df.select("feature_group").distinct().rdd.flatMap(lambda x: x).collect()
+    
+    for feature_group in feature_groups:
+        src_path = metadata_df.filter(col("feature_group") == feature_group).select("src_path").first()[0]
+        df = read_source_data(spark, src_path)
+        df = apply_transformations(df, metadata_df, feature_group)
+        target_path = metadata_df.filter(col("feature_group") == feature_group).select("target_path").first()[0]
+        df.write.mode("overwrite").partitionBy("business_day").parquet(target_path)
+    
+    spark.stop()
+
+if __name__ == "__main__":
+    main()
